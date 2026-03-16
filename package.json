@@ -1,7 +1,5 @@
 {
   "name": "demex-tarif-proxy",
   "version": "1.0.0",
-  "dependencies": {
-    "xmlrpc": "^1.3.2"
-  }
+  "dependencies": {}
 }
