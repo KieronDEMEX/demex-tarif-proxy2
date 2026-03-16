@@ -1,4 +1,5 @@
-const xmlrpc = require('xmlrpc');
+// Zero dependencies — Node.js natif uniquement
+const https = require('https');
 
 const ODOO_URL       = process.env.ODOO_URL      || '';
 const ODOO_DB        = process.env.ODOO_DB       || '';
@@ -25,24 +26,87 @@ const CATEGORY_MAP = {
     'All / GRILLAGE':                             'Grillage simple torsion',
 };
 
-function getClients() {
-    const host = ODOO_URL.replace(/^https?:\/\//, '').split('/')[0];
-    const opts  = { host, port: 443, path: '/xmlrpc/2/common' };
-    const opts2 = { host, port: 443, path: '/xmlrpc/2/object' };
-    return {
-        common: xmlrpc.createSecureClient(opts),
-        object: xmlrpc.createSecureClient(opts2),
-    };
-}
-
-function call(client, method, params) {
+// ── JSON-RPC (Odoo interne — pas session/authenticate) ────────
+// On utilise /jsonrpc qui accepte la clé API directement
+function jsonPost(path, method, params) {
     return new Promise((resolve, reject) => {
-        client.methodCall(method, params, (err, val) => {
-            if (err) reject(err); else resolve(val);
+        const hostname = ODOO_URL.replace(/^https?:\/\//, '').split('/')[0];
+        const body = Buffer.from(JSON.stringify({
+            jsonrpc: '2.0', method: 'call', id: 1,
+            params: { service: 'object', method, args: params }
+        }), 'utf8');
+        const req = https.request({
+            hostname, path, method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': body.length
+            }
+        }, res => {
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                try {
+                    const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                    if (data.error) reject(new Error(JSON.stringify(data.error)));
+                    else resolve(data.result);
+                } catch(e) { reject(e); }
+            });
         });
+        req.on('error', reject);
+        req.write(body); req.end();
     });
 }
 
+// Auth via /xmlrpc/2/common avec XML minimal
+function xmlPost(path, xmlBody) {
+    return new Promise((resolve, reject) => {
+        const hostname = ODOO_URL.replace(/^https?:\/\//, '').split('/')[0];
+        const body = Buffer.from(xmlBody, 'utf8');
+        const req = https.request({
+            hostname, path, method: 'POST',
+            headers: { 'Content-Type': 'text/xml', 'Content-Length': body.length }
+        }, res => {
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const xml = Buffer.concat(chunks).toString('utf8');
+                // Extract int value (uid)
+                const m = xml.match(/<(?:int|i4)>(\d+)<\/(?:int|i4)>/);
+                if (m) resolve(parseInt(m[1]));
+                else if (xml.includes('<boolean>0</boolean>')) resolve(false);
+                else reject(new Error('Auth failed: ' + xml.slice(0, 200)));
+            });
+        });
+        req.on('error', reject);
+        req.write(body); req.end();
+    });
+}
+
+function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function odooAuth() {
+    const xml = `<?xml version="1.0"?><methodCall><methodName>authenticate</methodName><params>` +
+        `<param><value><string>${esc(ODOO_DB)}</string></value></param>` +
+        `<param><value><string>${esc(ODOO_USERNAME)}</string></value></param>` +
+        `<param><value><string>${esc(ODOO_API_KEY)}</string></value></param>` +
+        `<param><value><struct></struct></value></param>` +
+        `</params></methodCall>`;
+    const uid = await xmlPost('/xmlrpc/2/common', xml);
+    if (!uid) throw new Error('Auth échouée — vérifiez ODOO_USERNAME / ODOO_API_KEY');
+    console.log('[DEMEX] uid=' + uid);
+    return uid;
+}
+
+// ORM via /jsonrpc (bypasse la session, utilise uid+password directement)
+async function odooRpc(uid, model, method, args, kwargs) {
+    return jsonPost('/jsonrpc', 'execute_kw', [
+        ODOO_DB, uid, ODOO_API_KEY, model, method, args || [], kwargs || {}
+    ]);
+}
+
+// ── Handler ───────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin',  ALLOWED_ORIGIN);
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -54,71 +118,68 @@ module.exports = async function handler(req, res) {
     if (!email) return res.status(400).json({ error: 'email requis' });
 
     try {
-        const { common, object } = getClients();
+        const uid = await odooAuth();
 
-        // 1. Auth
-        const uid = await call(common, 'authenticate',
-            [ODOO_DB, ODOO_USERNAME, ODOO_API_KEY, {}]);
-        if (!uid) throw new Error('Auth échouée');
-        console.log('[DEMEX] uid=' + uid);
+        // Chercher res.users par login (email) → lire partner_id + pricelist
+        const users = await odooRpc(uid, 'res.users', 'search_read',
+            [[['login', '=', email]]],
+            { fields: ['name', 'partner_id'], limit: 1 }
+        );
+        console.log('[DEMEX] users:', JSON.stringify(users));
 
-        // 2. Partner par email
-        const pids = await call(object, 'execute_kw',
-            [ODOO_DB, uid, ODOO_API_KEY, 'res.partner', 'search',
-             [[['email', '=', email]]], { limit: 1 }]);
-        console.log('[DEMEX] pids:', pids);
-
-        if (!pids || !pids.length) {
-            return res.json({ plId: 0, plName: '', discounts: {}, debug: 'partner not found' });
+        let partnerId = null;
+        if (users && users.length) {
+            partnerId = Array.isArray(users[0].partner_id)
+                ? users[0].partner_id[0]
+                : users[0].partner_id;
         }
 
-        // 3. Lire pricelist via ir.property
-        const props = await call(object, 'execute_kw',
-            [ODOO_DB, uid, ODOO_API_KEY, 'ir.property', 'search_read',
-             [[['name','=','property_product_pricelist'],
-               ['res_id','=','res.partner,'+pids[0]]]],
-             { fields: ['value_reference'], limit: 1 }]);
-        console.log('[DEMEX] ir.property:', JSON.stringify(props));
+        // Si pas trouvé par login, chercher par email dans res.partner
+        if (!partnerId) {
+            const partners = await odooRpc(uid, 'res.partner', 'search_read',
+                [[['email', '=', email]]],
+                { fields: ['id'], limit: 1 }
+            );
+            console.log('[DEMEX] partners:', JSON.stringify(partners));
+            if (partners && partners.length) partnerId = partners[0].id;
+        }
 
+        if (!partnerId) {
+            return res.json({ plId: 0, plName: '', discounts: {}, debug: 'user/partner not found: ' + email });
+        }
+
+        // Lire la pricelist via res.partner — Odoo 18 stocke ça dans la table
+        // property_product_pricelist est accessible via search sur product.pricelist
+        // en filtrant sur les partenaires. Méthode la plus fiable en v18 :
+        // on lit directement le champ via l'ORM avec le bon contexte
+        const partnerData = await odooRpc(uid, 'res.partner', 'read',
+            [[partnerId]],
+            { fields: ['name', 'property_product_pricelist'] }
+        );
+        console.log('[DEMEX] partnerData:', JSON.stringify(partnerData));
+
+        const pl = partnerData?.[0]?.property_product_pricelist;
         let plId = 0, plName = '';
 
-        if (props && props.length && props[0].value_reference) {
-            plId = parseInt(props[0].value_reference.split(',')[1]) || 0;
+        if (pl && Array.isArray(pl) && pl[0]) {
+            plId   = pl[0];
+            plName = pl[1] || '';
+        } else if (pl && typeof pl === 'number') {
+            plId = pl;
         }
 
-        // Fallback: lire la pricelist par défaut (res_id = false)
-        if (!plId) {
-            const defProps = await call(object, 'execute_kw',
-                [ODOO_DB, uid, ODOO_API_KEY, 'ir.property', 'search_read',
-                 [[['name','=','property_product_pricelist'],['res_id','=',false]]],
-                 { fields: ['value_reference'], limit: 1 }]);
-            console.log('[DEMEX] default ir.property:', JSON.stringify(defProps));
-            if (defProps && defProps.length && defProps[0].value_reference) {
-                plId = parseInt(defProps[0].value_reference.split(',')[1]) || 0;
-            }
-        }
+        console.log('[DEMEX] plId=' + plId + ' plName=' + plName);
 
         if (!plId) {
-            return res.json({ plId: 0, plName: '', discounts: {}, debug: 'no pricelist in ir.property' });
+            return res.json({ plId: 0, plName: '', discounts: {}, debug: 'no pricelist for partner ' + partnerId });
         }
 
-        // 4. Nom de la pricelist
-        const pls = await call(object, 'execute_kw',
-            [ODOO_DB, uid, ODOO_API_KEY, 'product.pricelist', 'read',
-             [[plId]], { fields: ['name'] }]);
-        plName = pls?.[0]?.name || '';
-        console.log('[DEMEX] pricelist:', plId, plName);
-
-        // 5. Règles de remise
-        const itemIds = await call(object, 'execute_kw',
-            [ODOO_DB, uid, ODOO_API_KEY, 'product.pricelist.item', 'search',
-             [[['pricelist_id', '=', plId]]]]);
-
-        const items = itemIds && itemIds.length ? await call(object, 'execute_kw',
-            [ODOO_DB, uid, ODOO_API_KEY, 'product.pricelist.item', 'read',
-             [itemIds],
-             { fields: ['compute_price','percent_price','price_discount','applied_on','categ_id'] }])
-            : [];
+        // Lire les règles
+        const items = await odooRpc(uid, 'product.pricelist.item', 'search_read',
+            [[['pricelist_id', '=', plId]]],
+            { fields: ['compute_price', 'percent_price', 'price_discount', 'applied_on', 'categ_id'] }
+        );
+        console.log('[DEMEX] items count:', items?.length);
 
         const discounts = {};
         for (const item of (items || [])) {
@@ -138,7 +199,7 @@ module.exports = async function handler(req, res) {
         return res.json({ plId, plName, discounts });
 
     } catch (err) {
-        console.error('[DEMEX]', err.message);
+        console.error('[DEMEX] ERROR:', err.message);
         return res.status(500).json({ error: err.message });
     }
 };
