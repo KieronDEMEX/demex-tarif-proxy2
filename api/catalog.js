@@ -1,9 +1,18 @@
+const fs   = require('fs');
+const path = require('path');
+
 module.exports = async function handler(req, res) {
-    var ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://demexfr.com';
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
     if (req.method === 'OPTIONS') return res.status(200).end();
-    var catalog = require('./catalog.json');
-    return res.json(catalog);
+
+    try {
+        const filePath = path.join(__dirname, 'catalog.json');
+        const data     = fs.readFileSync(filePath, 'utf8');
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        return res.status(200).send(data);
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
 };
