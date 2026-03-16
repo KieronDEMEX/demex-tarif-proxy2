@@ -1,4 +1,3 @@
-// Zero dependencies — Node.js natif uniquement
 const https = require('https');
 
 const ODOO_URL       = process.env.ODOO_URL      || '';
@@ -26,21 +25,41 @@ const CATEGORY_MAP = {
     'All / GRILLAGE':                             'Grillage simple torsion',
 };
 
-// ── JSON-RPC (Odoo interne — pas session/authenticate) ────────
-// On utilise /jsonrpc qui accepte la clé API directement
-function jsonPost(path, method, params) {
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function xmlPost(path, xmlBody) {
+    return new Promise((resolve, reject) => {
+        const hostname = ODOO_URL.replace(/^https?:\/\//, '').split('/')[0];
+        const body = Buffer.from(xmlBody, 'utf8');
+        const req = https.request({
+            hostname, path, method: 'POST',
+            headers: { 'Content-Type': 'text/xml', 'Content-Length': body.length }
+        }, res => {
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const xml = Buffer.concat(chunks).toString('utf8');
+                const m = xml.match(/<(?:int|i4)>(\d+)<\/(?:int|i4)>/);
+                if (m) resolve(parseInt(m[1]));
+                else if (xml.includes('<boolean>0</boolean>')) resolve(false);
+                else reject(new Error('Auth failed: ' + xml.slice(0, 300)));
+            });
+        });
+        req.on('error', reject);
+        req.write(body); req.end();
+    });
+}
+
+function jsonPost(path, params) {
     return new Promise((resolve, reject) => {
         const hostname = ODOO_URL.replace(/^https?:\/\//, '').split('/')[0];
         const body = Buffer.from(JSON.stringify({
             jsonrpc: '2.0', method: 'call', id: 1,
-            params: { service: 'object', method, args: params }
+            params: { service: 'object', method: 'execute_kw', args: params }
         }), 'utf8');
         const req = https.request({
             hostname, path, method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': body.length
-            }
+            headers: { 'Content-Type': 'application/json', 'Content-Length': body.length }
         }, res => {
             const chunks = [];
             res.on('data', c => chunks.push(c));
@@ -57,35 +76,6 @@ function jsonPost(path, method, params) {
     });
 }
 
-// Auth via /xmlrpc/2/common avec XML minimal
-function xmlPost(path, xmlBody) {
-    return new Promise((resolve, reject) => {
-        const hostname = ODOO_URL.replace(/^https?:\/\//, '').split('/')[0];
-        const body = Buffer.from(xmlBody, 'utf8');
-        const req = https.request({
-            hostname, path, method: 'POST',
-            headers: { 'Content-Type': 'text/xml', 'Content-Length': body.length }
-        }, res => {
-            const chunks = [];
-            res.on('data', c => chunks.push(c));
-            res.on('end', () => {
-                const xml = Buffer.concat(chunks).toString('utf8');
-                // Extract int value (uid)
-                const m = xml.match(/<(?:int|i4)>(\d+)<\/(?:int|i4)>/);
-                if (m) resolve(parseInt(m[1]));
-                else if (xml.includes('<boolean>0</boolean>')) resolve(false);
-                else reject(new Error('Auth failed: ' + xml.slice(0, 200)));
-            });
-        });
-        req.on('error', reject);
-        req.write(body); req.end();
-    });
-}
-
-function esc(s) {
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
 async function odooAuth() {
     const xml = `<?xml version="1.0"?><methodCall><methodName>authenticate</methodName><params>` +
         `<param><value><string>${esc(ODOO_DB)}</string></value></param>` +
@@ -94,111 +84,84 @@ async function odooAuth() {
         `<param><value><struct></struct></value></param>` +
         `</params></methodCall>`;
     const uid = await xmlPost('/xmlrpc/2/common', xml);
-    if (!uid) throw new Error('Auth échouée — vérifiez ODOO_USERNAME / ODOO_API_KEY');
-    console.log('[DEMEX] uid=' + uid);
+    if (!uid) throw new Error('Auth échouée');
     return uid;
 }
 
-// ORM via /jsonrpc (bypasse la session, utilise uid+password directement)
 async function odooRpc(uid, model, method, args, kwargs) {
-    return jsonPost('/jsonrpc', 'execute_kw', [
-        ODOO_DB, uid, ODOO_API_KEY, model, method, args || [], kwargs || {}
-    ]);
+    return jsonPost('/jsonrpc', [ODOO_DB, uid, ODOO_API_KEY, model, method, args||[], kwargs||{}]);
 }
 
-// ── Handler ───────────────────────────────────────────────────
+async function getDiscountsByPartnerId(uid, partnerId) {
+    const partnerData = await odooRpc(uid, 'res.partner', 'read',
+        [[partnerId]], { fields: ['name', 'property_product_pricelist'] }
+    );
+    const pl = partnerData?.[0]?.property_product_pricelist;
+    const plId   = pl && Array.isArray(pl) ? pl[0] : (pl || 0);
+    const plName = pl && Array.isArray(pl) ? (pl[1] || '') : '';
+    if (!plId) return { plId: 0, plName: '', discounts: {} };
+
+    const items = await odooRpc(uid, 'product.pricelist.item', 'search_read',
+        [[['pricelist_id', '=', plId]]],
+        { fields: ['compute_price','percent_price','price_discount','applied_on','categ_id'] }
+    );
+    const discounts = {};
+    for (const item of (items || [])) {
+        let pct = 0;
+        if (item.compute_price === 'percentage') pct = item.percent_price || 0;
+        else if (item.compute_price === 'formula') pct = item.price_discount || 0;
+        if (item.applied_on === '2_product_category' && item.categ_id) {
+            const w = CATEGORY_MAP[Array.isArray(item.categ_id) ? item.categ_id[1] : item.categ_id];
+            if (w) discounts[w] = pct;
+        } else if (item.applied_on === '3_global') {
+            for (const w of Object.values(CATEGORY_MAP)) { if (!discounts[w]) discounts[w] = pct; }
+        }
+    }
+    return { plId, plName, discounts };
+}
+
 module.exports = async function handler(req, res) {
-    res.setHeader('Access-Control-Allow-Origin',  ALLOWED_ORIGIN);
+    res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     if (req.method === 'OPTIONS') return res.status(200).end();
     if (req.method !== 'GET')     return res.status(405).json({ error: 'Method not allowed' });
 
-    const email = req.query.email;
-    if (!email) return res.status(400).json({ error: 'email requis' });
+    const email     = req.query.email;
+    const partnerId = req.query.partner_id ? parseInt(req.query.partner_id) : null;
+
+    if (!email && !partnerId) return res.status(400).json({ error: 'email ou partner_id requis' });
 
     try {
         const uid = await odooAuth();
 
-        // Chercher res.users par login (email) → lire partner_id + pricelist
-        const users = await odooRpc(uid, 'res.users', 'search_read',
-            [[['login', '=', email]]],
-            { fields: ['name', 'partner_id'], limit: 1 }
-        );
-        console.log('[DEMEX] users:', JSON.stringify(users));
-
-        let partnerId = null;
-        if (users && users.length) {
-            partnerId = Array.isArray(users[0].partner_id)
-                ? users[0].partner_id[0]
-                : users[0].partner_id;
+        // Mode 1: partner_id direct (portail connecté) — le plus fiable
+        if (partnerId) {
+            console.log('[DEMEX] partner_id=' + partnerId);
+            const result = await getDiscountsByPartnerId(uid, partnerId);
+            console.log(`[DEMEX] partner ${partnerId} → ${result.plName} (${Object.keys(result.discounts).length} remises)`);
+            return res.json(result);
         }
 
-        // Si pas trouvé par login, chercher par email dans res.partner
-        if (!partnerId) {
-            const partners = await odooRpc(uid, 'res.partner', 'search_read',
-                [[['email', '=', email]]],
-                { fields: ['id'], limit: 1 }
-            );
-            console.log('[DEMEX] partners:', JSON.stringify(partners));
-            if (partners && partners.length) partnerId = partners[0].id;
-        }
-
-        if (!partnerId) {
-            return res.json({ plId: 0, plName: '', discounts: {}, debug: 'user/partner not found: ' + email });
-        }
-
-        // Lire la pricelist via res.partner — Odoo 18 stocke ça dans la table
-        // property_product_pricelist est accessible via search sur product.pricelist
-        // en filtrant sur les partenaires. Méthode la plus fiable en v18 :
-        // on lit directement le champ via l'ORM avec le bon contexte
-        const partnerData = await odooRpc(uid, 'res.partner', 'read',
-            [[partnerId]],
-            { fields: ['name', 'property_product_pricelist'] }
-        );
-        console.log('[DEMEX] partnerData:', JSON.stringify(partnerData));
-
-        const pl = partnerData?.[0]?.property_product_pricelist;
-        let plId = 0, plName = '';
-
-        if (pl && Array.isArray(pl) && pl[0]) {
-            plId   = pl[0];
-            plName = pl[1] || '';
-        } else if (pl && typeof pl === 'number') {
-            plId = pl;
-        }
-
-        console.log('[DEMEX] plId=' + plId + ' plName=' + plName);
-
-        if (!plId) {
-            return res.json({ plId: 0, plName: '', discounts: {}, debug: 'no pricelist for partner ' + partnerId });
-        }
-
-        // Lire les règles
-        const items = await odooRpc(uid, 'product.pricelist.item', 'search_read',
-            [[['pricelist_id', '=', plId]]],
-            { fields: ['compute_price', 'percent_price', 'price_discount', 'applied_on', 'categ_id'] }
-        );
-        console.log('[DEMEX] items count:', items?.length);
-
-        const discounts = {};
-        for (const item of (items || [])) {
-            let pct = 0;
-            if (item.compute_price === 'percentage') pct = item.percent_price || 0;
-            else if (item.compute_price === 'formula') pct = item.price_discount || 0;
-            if (item.applied_on === '2_product_category' && item.categ_id) {
-                const name = Array.isArray(item.categ_id) ? item.categ_id[1] : item.categ_id;
-                const w = CATEGORY_MAP[name];
-                if (w) discounts[w] = pct;
-            } else if (item.applied_on === '3_global') {
-                for (const w of Object.values(CATEGORY_MAP)) { if (!discounts[w]) discounts[w] = pct; }
+        // Mode 2: email (admin ou lien direct)
+        const pids = await odooRpc(uid, 'res.partner', 'search',
+            [[['email', '=', email]]], { limit: 1 });
+        if (!pids || !pids.length) {
+            // Essai par login utilisateur
+            const users = await odooRpc(uid, 'res.users', 'search_read',
+                [[['login', '=', email]]], { fields: ['partner_id'], limit: 1 });
+            if (users && users.length) {
+                const pid = Array.isArray(users[0].partner_id) ? users[0].partner_id[0] : users[0].partner_id;
+                const result = await getDiscountsByPartnerId(uid, pid);
+                return res.json(result);
             }
+            return res.json({ plId: 0, plName: '', discounts: {}, debug: 'not found: ' + email });
         }
+        const result = await getDiscountsByPartnerId(uid, pids[0]);
+        console.log(`[DEMEX] ${email} → ${result.plName} (${Object.keys(result.discounts).length} remises)`);
+        return res.json(result);
 
-        console.log(`[DEMEX] ${email} → ${plName} (${Object.keys(discounts).length} remises)`);
-        return res.json({ plId, plName, discounts });
-
-    } catch (err) {
+    } catch(err) {
         console.error('[DEMEX] ERROR:', err.message);
         return res.status(500).json({ error: err.message });
     }
