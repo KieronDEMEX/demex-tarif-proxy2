@@ -1,13 +1,11 @@
 const fetch = require('node-fetch');
 
-// ── CONFIG (variables d'environnement Vercel) ─────────────────
-const ODOO_URL      = process.env.ODOO_URL;
-const ODOO_DB       = process.env.ODOO_DB;
-const ODOO_USERNAME = process.env.ODOO_USERNAME;
-const ODOO_API_KEY  = process.env.ODOO_API_KEY;
+const ODOO_URL       = process.env.ODOO_URL;
+const ODOO_DB        = process.env.ODOO_DB;
+const ODOO_USERNAME  = process.env.ODOO_USERNAME;
+const ODOO_API_KEY   = process.env.ODOO_API_KEY;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://demexfr.com';
 
-// ── CORRESPONDANCE CATÉGORIES ─────────────────────────────────
 const CATEGORY_MAP = {
     'All / PANNEAU VIKING STRONG':                'Panneau Viking Strong',
     'All / PANNEAU VIKING MEDIUM':                'Panneau Viking Medium',
@@ -27,59 +25,69 @@ const CATEGORY_MAP = {
     'All / GRILLAGE':                             'Grillage simple torsion',
 };
 
-// ── ODOO RPC ──────────────────────────────────────────────────
-async function odooCall(endpoint, params) {
-    // Authentification avec clé API (header Authorization)
-    const res = await fetch(`${ODOO_URL}${endpoint}`, {
+// Session cookie persistante entre les appels
+let _sessionCookie = null;
+
+async function odooPost(path, params) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (_sessionCookie) headers['Cookie'] = _sessionCookie;
+
+    const res = await fetch(`${ODOO_URL}${path}`, {
         method:  'POST',
-        headers: {
-            'Content-Type':  'application/json',
-            'Authorization': `Bearer ${ODOO_API_KEY}`,
-        },
+        headers: headers,
         body: JSON.stringify({
             jsonrpc: '2.0', method: 'call',
             id: Math.floor(Math.random() * 99999),
             params,
         }),
     });
+
+    // Sauvegarder le cookie de session
+    const setCookie = res.headers.get('set-cookie');
+    if (setCookie) {
+        _sessionCookie = setCookie.split(';')[0];
+    }
+
     const data = await res.json();
     if (data.error) throw new Error(data.error.data?.message || JSON.stringify(data.error));
     return data.result;
 }
 
-async function odooRpc(model, method, args, kwargs) {
-    return odooCall('/web/dataset/call_kw', { model, method, args: args||[], kwargs: kwargs||{} });
-}
-
 async function odooAuth() {
-    const result = await odooCall('/web/session/authenticate', {
-        db: ODOO_DB, login: ODOO_USERNAME, password: ODOO_API_KEY,
+    // Odoo 18 : la clé API s'utilise comme mot de passe dans authenticate
+    const result = await odooPost('/web/session/authenticate', {
+        db:       ODOO_DB,
+        login:    ODOO_USERNAME,
+        password: ODOO_API_KEY,
     });
-    if (!result || !result.uid) throw new Error('Auth Odoo échouée');
+    if (!result || !result.uid) throw new Error('Auth Odoo échouée — vérifiez ODOO_USERNAME et ODOO_API_KEY');
+    console.log('[DEMEX] Auth OK, uid=' + result.uid);
     return result.uid;
 }
 
-// ── HANDLER VERCEL ────────────────────────────────────────────
+async function odooRpc(model, method, args, kwargs) {
+    return odooPost('/web/dataset/call_kw', {
+        model, method,
+        args:   args   || [],
+        kwargs: kwargs || {},
+    });
+}
+
 module.exports = async function handler(req, res) {
-    // CORS
-    res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+    res.setHeader('Access-Control-Allow-Origin',  ALLOWED_ORIGIN);
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') { return res.status(200).end(); }
-    if (req.method !== 'GET')     { return res.status(405).json({ error: 'Method not allowed' }); }
+    if (req.method === 'OPTIONS') return res.status(200).end();
+    if (req.method !== 'GET')     return res.status(405).json({ error: 'Method not allowed' });
 
     const email = req.query.email;
-    if (!email) return res.status(400).json({ error: 'email requis (?email=client@exemple.com)' });
-
-    if (!ODOO_URL || !ODOO_API_KEY) {
-        return res.status(500).json({ error: 'Variables Odoo non configurées sur Vercel' });
-    }
+    if (!email) return res.status(400).json({ error: 'email requis' });
 
     try {
-        // 1. Auth Odoo
-        await odooAuth();
+        // Auth (réutilise le cookie si déjà authentifié)
+        if (!_sessionCookie) await odooAuth();
 
-        // 2. Trouver le partenaire par email
+        // Chercher le partenaire par email
         const partners = await odooRpc('res.partner', 'search_read',
             [[['email', '=', email]]],
             { fields: ['id', 'name', 'property_product_pricelist'], limit: 1 }
@@ -96,7 +104,7 @@ module.exports = async function handler(req, res) {
 
         const plId = pl[0], plName = pl[1];
 
-        // 3. Lire les règles de remise
+        // Lire les règles de remise
         const items = await odooRpc('product.pricelist.item', 'search_read',
             [[['pricelist_id', '=', plId]]],
             { fields: ['compute_price','percent_price','price_discount','applied_on','categ_id'] }
@@ -122,6 +130,17 @@ module.exports = async function handler(req, res) {
         return res.json({ plId, plName, discounts });
 
     } catch (err) {
+        // Session expirée → reset et réessayer une fois
+        if (err.message.includes('session') || err.message.includes('Access')) {
+            _sessionCookie = null;
+            try {
+                await odooAuth();
+                // Retry simplifié
+                return res.status(500).json({ error: 'Session réinitialisée, réessayez' });
+            } catch (e2) {
+                return res.status(500).json({ error: e2.message });
+            }
+        }
         console.error('[DEMEX] Erreur:', err.message);
         return res.status(500).json({ error: err.message });
     }
